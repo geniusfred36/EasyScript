@@ -1,4 +1,4 @@
-# EasyScript 3.2 — Command Reference
+# EasyScript 1.0.3 — Command Reference
 
 This reference is based on the EasyScript 3.2 English source. EasyScript supports both **bracket-style statements** such as `TEXT["Hello"]` and **functions inside expressions** such as `upper("hello")`.
 
