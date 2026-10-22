@@ -1,0 +1,10 @@
+- OPTION 1 installation via releases
+
+For option one please install the .exe file in the releases section: https://github.com/geniusfred36/EasyScript/releases/tag/stable-release
+
+- OPTION 2 installation via powershell
+
+Please copy the following link into powershell: curl.exe -L "https://github.com/geniusfred36/EasyScript/releases/download/releases/EasyScript_1.0.3.exe" -o "EasyScript.exe"
+
+To run the file via powershell simply type: .\EasyScript.exe
+
