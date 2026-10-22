@@ -1,0 +1,1711 @@
+#THIS SOURCE CODE IS A LITTLE DIFFERENT FROM THE RELEASE
+
+
+
+#!/usr/bin/env python3
+"""EasyScript 3.2 — a standalone, beginner-friendly scripting language runtime with authenticated remote .easy editing.
+
+EasyScript programs do not execute Python source. Expressions are parsed by the
+EasyScript expression parser below. Existing EasyScript and DuckyScript commands
+from version 2.x are retained where practical.
+"""
+from __future__ import annotations
+
+import datetime as _datetime
+import getpass
+import hmac
+import json
+import math
+import ipaddress as _ipaddress
+import os
+import platform
+import random
+import re
+import shutil
+import shlex
+import secrets
+import tempfile
+import socket
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import urllib.error as _urlerror
+import urllib.parse as _urlparse
+import urllib.request as _urlrequest
+from pathlib import Path
+from typing import Any, Callable
+
+try:
+    import pyautogui  # optional: only used by TYPE/PRESS and DuckyScript commands
+    PYAUTOGUI_AVAILABLE = True
+except Exception:
+    pyautogui = None
+    PYAUTOGUI_AVAILABLE = False
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+CYAN = "\033[96m"
+MAGENTA = "\033[95m"
+
+if os.name == "nt":
+    try:
+        os.system("")
+    except Exception:
+        pass
+
+
+class EasyScriptError(Exception):
+    """Error raised by the EasyScript runtime."""
+
+
+class ReturnSignal(Exception):
+    def __init__(self, value: Any = None):
+        self.value = value
+
+
+class BreakSignal(Exception):
+    pass
+
+
+class ContinueSignal(Exception):
+    pass
+
+
+class EasyFunction:
+    def __init__(self, name: str, params: list[str], defaults: dict[str, Any], body: list[str]):
+        self.name = name
+        self.params = params
+        self.defaults = defaults
+        self.body = body
+
+
+# --------------------------- EasyScript expressions ------------------------
+_TOKEN_RE = re.compile(
+    r"(?P<SPACE>\s+)"
+    r"|(?P<NUMBER>(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?)"
+    r"|(?P<STRING>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')"
+    r"|(?P<IDENT>[A-Za-z_][A-Za-z0-9_]*)"
+    r"|(?P<OP>\*\*|//|==|!=|<=|>=|\+=|-=|\*=|/=|%=|[+\-*/%<>()\[\]{},:])"
+)
+
+
+def _decode_string(token: str) -> str:
+    if token.startswith('"'):
+        try:
+            return json.loads(token)
+        except Exception:
+            pass
+    body = token[1:-1]
+    replacements = {"\\n": "\n", "\\r": "\r", "\\t": "\t", "\\b": "\b", "\\f": "\f", "\\\\": "\\", "\\'": "'", '\\"': '"'}
+    for old, new in replacements.items():
+        body = body.replace(old, new)
+    return body
+
+
+class ExpressionParser:
+    """Small Pratt parser. It parses EasyScript expressions, never Python code."""
+    PRECEDENCE = {
+        "or": 10,
+        "and": 20,
+        "==": 30, "!=": 30, "<": 30, "<=": 30, ">": 30, ">=": 30,
+        "in": 30, "not in": 30,
+        "+": 40, "-": 40,
+        "*": 50, "/": 50, "//": 50, "%": 50,
+        "**": 60,
+    }
+
+    def __init__(self, runtime: "EasyScriptRuntime", source: str):
+        self.runtime = runtime
+        self.source = source
+        self.tokens: list[tuple[str, str]] = []
+        pos = 0
+        while pos < len(source):
+            match = _TOKEN_RE.match(source, pos)
+            if not match:
+                raise EasyScriptError(f"Onbekend teken in expressie bij positie {pos}: {source[pos:pos+12]!r}")
+            kind = match.lastgroup or ""
+            token = match.group()
+            pos = match.end()
+            if kind != "SPACE":
+                self.tokens.append((kind, token))
+        self.tokens.append(("EOF", ""))
+        self.index = 0
+
+    def peek(self) -> tuple[str, str]:
+        return self.tokens[self.index]
+
+    def take(self) -> tuple[str, str]:
+        token = self.peek()
+        self.index += 1
+        return token
+
+    def accept(self, value: str) -> bool:
+        if self.peek()[1].lower() == value.lower():
+            self.take()
+            return True
+        return False
+
+    def expect(self, value: str) -> None:
+        if not self.accept(value):
+            raise EasyScriptError(f"Verwacht {value!r} in expressie {self.source!r}")
+
+    def parse(self) -> Any:
+        if self.peek()[0] == "EOF":
+            return None
+        value = self.expression(0)
+        if self.peek()[0] != "EOF":
+            raise EasyScriptError(f"Onverwacht token {self.peek()[1]!r} in expressie {self.source!r}")
+        return value
+
+    def expression(self, min_precedence: int) -> Any:
+        left = self.prefix()
+        while True:
+            kind, raw_op = self.peek()
+            op = raw_op.lower()
+            if kind == "OP" and op == "(":
+                self.take()
+                args = self.parse_arguments(")")
+                left = self.runtime.call_value(left, args)
+                continue
+            if kind == "OP" and op == "[":
+                self.take()
+                left = self.parse_index(left)
+                continue
+            if kind == "IDENT" and op == "not":
+                if self.index + 1 < len(self.tokens) and self.tokens[self.index + 1][1].lower() == "in":
+                    op = "not in"
+                else:
+                    break
+            if op not in self.PRECEDENCE or self.PRECEDENCE[op] < min_precedence:
+                break
+            self.take()
+            if op == "not in":
+                self.expect("in")
+            precedence = self.PRECEDENCE[op]
+            right = self.expression(precedence if op == "**" else precedence + 1)
+            left = self.apply_operator(op, left, right)
+        return left
+
+    def prefix(self) -> Any:
+        kind, token = self.take()
+        lower = token.lower()
+        if kind == "NUMBER":
+            return float(token) if any(c in token for c in ".eE") else int(token)
+        if kind == "STRING":
+            return _decode_string(token)
+        if kind == "IDENT":
+            if lower in ("true", "waar"):
+                return True
+            if lower in ("false", "onwaar"):
+                return False
+            if lower in ("none", "null", "niks"):
+                return None
+            if lower == "not":
+                return not bool(self.expression(70))
+            if lower in ("pi", "e", "tau", "inf", "nan"):
+                return {"pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf, "nan": math.nan}[lower]
+            return self.runtime.resolve_name(token)
+        if kind == "OP" and token in ("-", "+"):
+            value = self.expression(70)
+            return -value if token == "-" else +value
+        if kind == "OP" and token == "(":
+            value = self.expression(0)
+            if self.accept(","):
+                values = [value]
+                while True:
+                    values.append(self.expression(0))
+                    if not self.accept(","):
+                        break
+                self.expect(")")
+                return tuple(values)
+            self.expect(")")
+            return value
+        if kind == "OP" and token == "[":
+            values = []
+            if not self.accept("]"):
+                while True:
+                    values.append(self.expression(0))
+                    if self.accept("]"):
+                        break
+                    self.expect(",")
+                    if self.accept("]"):
+                        break
+            return values
+        if kind == "OP" and token == "{":
+            result = {}
+            if not self.accept("}"):
+                while True:
+                    key = self.expression(0)
+                    self.expect(":")
+                    value = self.expression(0)
+                    result[key] = value
+                    if self.accept("}"):
+                        break
+                    self.expect(",")
+                    if self.accept("}"):
+                        break
+            return result
+        raise EasyScriptError(f"Onverwacht token {token!r} in expressie {self.source!r}")
+
+    def parse_arguments(self, end_token: str) -> list[Any]:
+        args = []
+        if self.accept(end_token):
+            return args
+        while True:
+            args.append(self.expression(0))
+            if self.accept(end_token):
+                break
+            self.expect(",")
+            if self.accept(end_token):
+                break
+        return args
+
+    def parse_index(self, target: Any) -> Any:
+        first = None
+        if not self.accept(":"):
+            first = self.expression(0)
+        if self.accept(":"):
+            stop = None if self.peek()[1] in (":", "]") else self.expression(0)
+            step = None
+            if self.accept(":"):
+                step = None if self.peek()[1] == "]" else self.expression(0)
+            self.expect("]")
+            return target[slice(first, stop, step)]
+        self.expect("]")
+        return target[first]
+
+    @staticmethod
+    def apply_operator(op: str, left: Any, right: Any) -> Any:
+        try:
+            if op == "+": return left + right
+            if op == "-": return left - right
+            if op == "*": return left * right
+            if op == "/": return left / right
+            if op == "//": return left // right
+            if op == "%": return left % right
+            if op == "**": return left ** right
+            if op == "==": return left == right
+            if op == "!=": return left != right
+            if op == "<": return left < right
+            if op == "<=": return left <= right
+            if op == ">": return left > right
+            if op == ">=": return left >= right
+            if op == "in": return left in right
+            if op == "not in": return left not in right
+            if op == "and": return bool(left) and bool(right)
+            if op == "or": return bool(left) or bool(right)
+        except Exception as exc:
+            raise EasyScriptError(f"Kan {left!r} {op} {right!r} niet berekenen: {exc}") from exc
+        raise EasyScriptError(f"Unknown operator: {op}")
+
+
+# ------------------------------- Runtime -----------------------------------
+class EasyScriptRuntime:
+    def __init__(self, script_path: str | None = None):
+        self.variables: dict[str, Any] = {}
+        self.scopes: list[dict[str, Any]] = []
+        self.functions: dict[str, EasyFunction] = {}
+        self.script_path = os.path.abspath(script_path or __file__)
+        self.script_dir = os.path.dirname(self.script_path)
+        self.loop_limit = 100_000
+        self.try_depth = 0
+        self.remote_server_started = False
+        self.builtins: dict[str, Callable[..., Any]] = {}
+        self._register_builtins()
+
+    def resolve_path(self, filename: Any) -> str:
+        name = str(filename).strip().strip('"').strip("'")
+        if os.path.isabs(name):
+            return name
+        first = os.path.join(self.script_dir, name)
+        second = os.path.join(os.getcwd(), name)
+        return first if os.path.exists(first) or not os.path.exists(second) else second
+
+    def resolve_name(self, name: str) -> Any:
+        if name in self.scopes[-1] if self.scopes else False:
+            return self.scopes[-1][name]
+        if name in self.variables:
+            return self.variables[name]
+        if name in self.functions:
+            return self.functions[name]
+        if name.lower() in self.builtins:
+            return self.builtins[name.lower()]
+        raise EasyScriptError(f"Unknown name: {name!r}. Use quotation marks for text.")
+
+    def set_var(self, name: str, value: Any) -> None:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise EasyScriptError(f"Invalid variable name: {name!r}")
+        if self.scopes:
+            self.scopes[-1][name] = value
+        else:
+            self.variables[name] = value
+
+    def eval_expr(self, source: str) -> Any:
+        return ExpressionParser(self, source.strip()).parse()
+
+    def call_value(self, fn: Any, args: list[Any]) -> Any:
+        if isinstance(fn, EasyFunction):
+            return self.call_user_function(fn, args)
+        if callable(fn):
+            try:
+                return fn(*args)
+            except EasyScriptError:
+                raise
+            except Exception as exc:
+                raise EasyScriptError(f"Function raised an error: {exc}") from exc
+        raise EasyScriptError(f"Dit kan niet als functie worden aangeroepen: {fn!r}")
+
+    def call_user_function(self, fn: EasyFunction, args: list[Any]) -> Any:
+        required = len(fn.params) - len(fn.defaults)
+        if len(args) < required or len(args) > len(fn.params):
+            raise EasyScriptError(f"Functie {fn.name} verwacht {required} tot {len(fn.params)} argument(en), kreeg {len(args)}")
+        local_scope = dict(zip(fn.params, args))
+        for param, default_value in fn.defaults.items():
+            if param not in local_scope:
+                local_scope[param] = default_value
+        self.scopes.append(local_scope)
+        try:
+            self.execute_range(fn.body, 0, len(fn.body))
+        except ReturnSignal as ret:
+            return ret.value
+        finally:
+            self.scopes.pop()
+        return None
+
+    def _register(self, names: str, fn: Callable[..., Any]) -> None:
+        for name in names.split():
+            self.builtins[name.lower()] = fn
+
+    def _register_builtins(self) -> None:
+        b = self._register
+        # Core type conversion, inspection and aggregate functions.
+        b("len lengte", len)
+        b("str tekst", str)
+        b("int geheel", lambda x=0: int(float(x)))
+        b("float kommagetal", float)
+        b("bool boolean", bool)
+        b("list lijst", list)
+        b("tuple", tuple)
+        b("dict woordenboek", dict)
+        b("set verzameling", set)
+        b("abs absoluut", abs)
+        b("round afronden", round)
+        b("min minimum", min)
+        b("max maximum", max)
+        b("sum som", sum)
+        b("sorted sorteer", sorted)
+        b("reversed omgekeerd", lambda x: list(reversed(x)))
+        b("range bereik", lambda *a: list(range(*[int(x) for x in a])))
+        b("any een_of_meer", any)
+        b("all allemaal", all)
+        b("pow macht", pow)
+        b("divmod deelrest", divmod)
+        b("ord codepunt", ord)
+        b("chr teken", chr)
+        b("bin binair", bin)
+        b("oct octaal", oct)
+        b("hex hexadecimaal", hex)
+        b("repr representatie", repr)
+        b("ascii ascii_tekst", ascii)
+        b("format opmaak", lambda value, spec="": format(value, spec))
+        b("type typevan", lambda x: type(x).__name__)
+        b("isinstance is_type", lambda value, type_name: type(value).__name__.lower() == str(type_name).lower())
+        b("issubclass is_subclass", self._is_subclass_type)
+        b("complex complex_getal", complex)
+        b("bytes", bytes)
+        b("bytearray", bytearray)
+        b("frozenset vaste_verzameling", frozenset)
+        b("hash", hash)
+        b("id object_id", id)
+        b("callable aanroepbaar", self._is_callable)
+        b("iter iterator", iter)
+        b("next volgende", self._next_item)
+        b("slice deelbereik", slice)
+        b("memoryview geheugenweergave", memoryview)
+        b("dir namen", self._dir)
+        b("globals globaal", self._globals)
+        b("locals lokaal", self._locals)
+        b("vars variabelen", self._locals)
+        b("isclose is_close bijna_gelijk", math.isclose)
+        b("fsum nauwkeurige_som", math.fsum)
+        b("prod product", math.prod)
+        b("comb combinaties", math.comb)
+        b("perm permutaties", math.perm)
+        b("copysign teken", math.copysign)
+        b("trunc afkappen", math.trunc)
+        b("enumerate genummerd", lambda x, start=0: list(enumerate(x, int(start))))
+        b("zip combineer", lambda *xs: list(zip(*xs)))
+        b("contains bevat", lambda container, item: item in container)
+        b("keys sleutels", lambda d: list(d.keys()))
+        b("values waarden", lambda d: list(d.values()))
+        b("items paren", lambda d: list(d.items()))
+        b("get ophalen", lambda d, key, default=None: d.get(key, default))
+        b("has_key heeft_sleutel", lambda d, key: key in d)
+        b("set_item stel_in", self._set_item)
+        b("delete_item verwijder_item", self._delete_item)
+        b("append voegtoe", self._append)
+        b("extend uitbreiden", self._extend)
+        b("insert invoegen", self._insert)
+        b("pop verwijderlaatste", self._pop)
+        b("remove verwijderwaarde", self._remove)
+        b("clear leegmaken", self._clear)
+        b("copy kopieer", lambda x: x.copy())
+        b("index positie", lambda seq, x: seq.index(x))
+        b("count tel", lambda seq, x: seq.count(x))
+        # String functions (also usable from an expression: UPPER("hello")).
+        b("upper hoofdletters", lambda x: str(x).upper())
+        b("lower kleineletters", lambda x: str(x).lower())
+        b("title titel", lambda x: str(x).title())
+        b("capitalize hoofdletter", lambda x: str(x).capitalize())
+        b("casefold vergelijktekst", lambda x: str(x).casefold())
+        b("strip trim", lambda x, chars=None: str(x).strip(chars))
+        b("lstrip trimlinks", lambda x, chars=None: str(x).lstrip(chars))
+        b("rstrip trimrechts", lambda x, chars=None: str(x).rstrip(chars))
+        b("replace vervang", lambda x, old, new, count=-1: str(x).replace(str(old), str(new), int(count)))
+        b("split splits", lambda x, sep=None: str(x).split(sep))
+        b("join samenvoegen", lambda sep, values: str(sep).join(map(str, values)))
+        b("startswith begintmet", lambda x, prefix: str(x).startswith(str(prefix)))
+        b("endswith eindigtmet", lambda x, suffix: str(x).endswith(str(suffix)))
+        b("find zoek", lambda x, sub: str(x).find(str(sub)))
+        b("rfind zoekrechts", lambda x, sub: str(x).rfind(str(sub)))
+        b("count_text teltekst", lambda x, sub: str(x).count(str(sub)))
+        b("isdigit isgetal", lambda x: str(x).isdigit())
+        b("isalpha isletters", lambda x: str(x).isalpha())
+        b("isalnum isletterscijfers", lambda x: str(x).isalnum())
+        b("isspace iswitruimte", lambda x: str(x).isspace())
+        b("center centreren", lambda x, width, fill=" ": str(x).center(int(width), str(fill)))
+        b("ljust linksuitlijnen", lambda x, width, fill=" ": str(x).ljust(int(width), str(fill)))
+        b("rjust rechtsuitlijnen", lambda x, width, fill=" ": str(x).rjust(int(width), str(fill)))
+        b("zfill nulvullen", lambda x, width: str(x).zfill(int(width)))
+        # Math: common numerical utilities.
+        b("sqrt wortel", math.sqrt)
+        b("floor naarbeneden", math.floor)
+        b("ceil naarboven", math.ceil)
+        b("sin", math.sin); b("cos", math.cos); b("tan", math.tan)
+        b("asin", math.asin); b("acos", math.acos); b("atan", math.atan)
+        b("atan2", math.atan2); b("degrees graden", math.degrees); b("radians radialen", math.radians)
+        b("log", math.log); b("log10", math.log10); b("exp", math.exp)
+        b("factorial faculteit", math.factorial); b("gcd", math.gcd)
+        if hasattr(math, "lcm"): b("lcm", math.lcm)
+        b("isqrt", math.isqrt); b("hypot", math.hypot)
+        b("isfinite eindig", math.isfinite); b("isinf oneindig", math.isinf); b("isnan isnietgetal", math.isnan)
+        b("clamp begrens", lambda x, low, high: max(low, min(high, x)))
+        # Random, dates and time.
+        b("random willekeurig", random.random)
+        b("randint willekeurig_geheel", random.randint)
+        b("uniform willekeurig_tussen", random.uniform)
+        b("choice willekeurige_keuze", random.choice)
+        b("sample steekproef", lambda seq, n: random.sample(seq, int(n)))
+        b("shuffle schud", self._shuffle)
+        b("seed startwaarde", random.seed)
+        b("today vandaag", lambda: _datetime.date.today().isoformat())
+        b("now nu", lambda: _datetime.datetime.now().isoformat(sep=" ", timespec="seconds"))
+        b("clock klok", time.time)
+        b("timestamp tijdstempel", time.time)
+        b("date_format datum_opmaak", self._date_format)
+        b("sleep wachten", lambda seconds: time.sleep(float(seconds)))
+        # File system and path utilities.
+        b("exists bestaat", lambda path: os.path.exists(self.resolve_path(path)))
+        b("is_file is_bestand", lambda path: os.path.isfile(self.resolve_path(path)))
+        b("is_dir is_map", lambda path: os.path.isdir(self.resolve_path(path)))
+        b("listdir bestanden", lambda path=".": os.listdir(self.resolve_path(path)))
+        b("mkdir maak_map", lambda path: os.makedirs(self.resolve_path(path), exist_ok=True))
+        b("read_text lees_bestand", self._read_text)
+        b("write_text schrijf_bestand", self._write_text)
+        b("append_text voeg_bestand_toe", self._append_text)
+        b("remove_file verwijder_bestand", lambda path: os.remove(self.resolve_path(path)))
+        b("copy_file kopieer_bestand", lambda src, dst: shutil.copy2(self.resolve_path(src), self.resolve_path(dst)))
+        b("move_file verplaats_bestand", lambda src, dst: shutil.move(self.resolve_path(src), self.resolve_path(dst)))
+        b("basename bestandsnaam", lambda p: os.path.basename(str(p)))
+        b("dirname mapnaam", lambda p: os.path.dirname(str(p)))
+        b("join_path pad", lambda *p: os.path.join(*map(str, p)))
+        b("abspath volledig_pad", lambda p: os.path.abspath(self.resolve_path(p)))
+        b("cwd werkmap", os.getcwd)
+        b("filesize bestandsgrootte", lambda p: os.path.getsize(self.resolve_path(p)))
+        # Structured data and regular expressions.
+        b("json_parse json_lees", json.loads)
+        b("json_stringify json_maakt", lambda value, pretty=False: json.dumps(value, ensure_ascii=False, indent=2 if pretty else None))
+        b("regex_search regex_zoek", lambda pattern, text: bool(re.search(str(pattern), str(text))))
+        b("regex_match regex_matcht", lambda pattern, text: bool(re.fullmatch(str(pattern), str(text))))
+        b("regex_findall regex_vindalles", lambda pattern, text: re.findall(str(pattern), str(text)))
+        b("regex_replace regex_vervang", lambda pattern, repl, text: re.sub(str(pattern), str(repl), str(text)))
+        # Network helpers. These are normal EasyScript built-ins; no Python source is evaluated.
+        b("dns_lookup dns_opzoeken", self._dns_lookup)
+        b("hostname hostnaam", socket.gethostname)
+        b("local_ip lokaal_ip", self._local_ip)
+        b("tcp_check poort_controleer poort_bereikbaar", self._tcp_check)
+        b("http_request http_verzoek", self._http_request)
+        b("http_get http_ophalen", self._http_get)
+        b("http_post http_versturen", self._http_post)
+        b("url_encode url_coderen", self._url_encode)
+        b("url_decode url_decoderen", _urlparse.unquote)
+        b("url_join url_combineren", _urlparse.urljoin)
+        b("url_query url_parameters", self._url_query)
+        b("is_ip ip_adres_geldig", self._is_ip)
+        b("ip_version ip_versie", self._ip_version)
+        b("ip_private ip_prive", self._ip_private)
+        b("ip_public ip_publiek", self._ip_public)
+        # Utilities and introspection.
+        b("input invoer", lambda prompt="": input(str(prompt)))
+        b("print toon", self._print_builtin)
+        b("error fout", lambda message="Fout": (_ for _ in ()).throw(EasyScriptError(str(message))))
+        b("assert_true controleer", self._assert_true)
+        b("map_to map", self._map_to)
+        b("filter_by filter", self._filter_by)
+        b("reduce_by reduce", self._reduce_by)
+        b("help helptekst", lambda: "Use HELP for commands. Expressions support calculations, lists, dictionaries, and functions.")
+        b("whoami gebruiker", getpass.getuser)
+        b("os_name besturingssysteem", platform.system)
+
+    @staticmethod
+    def _dns_lookup(host: Any) -> list[str]:
+        hostname = str(host).strip()
+        if not hostname:
+            raise EasyScriptError("DNS_LOOKUP expects a hostname or IP address")
+        try:
+            infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+            return sorted({info[4][0] for info in infos})
+        except OSError as exc:
+            raise EasyScriptError(f"DNS lookup failed for {hostname!r}: {exc}") from exc
+
+    @staticmethod
+    def _local_ip(destination: Any = "1.1.1.1", port: Any = 53) -> str:
+        """Return the local interface address selected for a route, without sending data."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect((str(destination), int(port)))
+            return str(sock.getsockname()[0])
+        except OSError:
+            return "127.0.0.1"
+        finally:
+            sock.close()
+
+    @staticmethod
+    def _tcp_check(host: Any, port: Any, timeout: Any = 3) -> bool:
+        try:
+            with socket.create_connection((str(host), int(port)), timeout=max(0.1, float(timeout))):
+                return True
+        except (OSError, ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def _http_request(url: Any, method: Any = "GET", body: Any = None, headers: Any = None, timeout: Any = 10) -> dict[str, Any]:
+        url_text = str(url).strip()
+        parsed = _urlparse.urlparse(url_text)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            raise EasyScriptError("HTTP_REQUEST verwacht een volledige http://- of https://-URL")
+        method_text = str(method).upper().strip()
+        if method_text not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}:
+            raise EasyScriptError("HTTP-methode moet GET, POST, PUT, PATCH, DELETE of HEAD zijn")
+        header_dict = {str(k): str(v) for k, v in headers.items()} if isinstance(headers, dict) else {}
+        payload = None
+        if body is not None and method_text not in {"GET", "HEAD"}:
+            if isinstance(body, (dict, list)):
+                payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                header_dict.setdefault("Content-Type", "application/json; charset=utf-8")
+            elif isinstance(body, bytes):
+                payload = body
+            else:
+                payload = str(body).encode("utf-8")
+        request = _urlrequest.Request(url_text, data=payload, headers=header_dict, method=method_text)
+        try:
+            try:
+                response = _urlrequest.urlopen(request, timeout=max(0.1, float(timeout)))
+            except _urlerror.HTTPError as http_error:
+                # HTTP errors still provide a status and sometimes a helpful response body.
+                response = http_error
+            with response:
+                raw_body = response.read(2_000_001)
+                truncated = len(raw_body) > 2_000_000
+                raw_body = raw_body[:2_000_000]
+                content_type = response.headers.get("Content-Type", "")
+                charset_match = re.search(r"charset=([^;\s]+)", content_type, flags=re.I)
+                charset = charset_match.group(1).strip('"\'') if charset_match else "utf-8"
+                try:
+                    decoded = raw_body.decode(charset, errors="replace")
+                except LookupError:
+                    decoded = raw_body.decode("utf-8", errors="replace")
+                return {
+                    "status": int(getattr(response, "status", response.getcode())),
+                    "reason": str(getattr(response, "reason", "")),
+                    "url": str(response.geturl()),
+                    "headers": {str(k): str(v) for k, v in response.headers.items()},
+                    "body": decoded,
+                    "truncated": truncated,
+                }
+        except (OSError, ValueError, _urlerror.URLError) as exc:
+            raise EasyScriptError(f"HTTP request failed for {url_text!r}: {exc}") from exc
+
+    @classmethod
+    def _http_get(cls, url: Any, timeout: Any = 10, headers: Any = None) -> str:
+        return str(cls._http_request(url, "GET", None, headers, timeout)["body"])
+
+    @classmethod
+    def _http_post(cls, url: Any, body: Any, content_type: Any = "application/json", timeout: Any = 10, headers: Any = None) -> dict[str, Any]:
+        header_dict = dict(headers) if isinstance(headers, dict) else {}
+        header_dict.setdefault("Content-Type", str(content_type))
+        return cls._http_request(url, "POST", body, header_dict, timeout)
+
+    @staticmethod
+    def _url_encode(value: Any) -> str:
+        if isinstance(value, dict):
+            return _urlparse.urlencode(value, doseq=True)
+        return _urlparse.quote(str(value), safe="")
+
+    @staticmethod
+    def _url_query(value: Any) -> str:
+        if not isinstance(value, dict):
+            raise EasyScriptError('URL_QUERY verwacht een woordenboek, bijvoorbeeld {"zoek": "hallo wereld"}')
+        return _urlparse.urlencode(value, doseq=True)
+
+    @staticmethod
+    def _is_ip(value: Any) -> bool:
+        try:
+            _ipaddress.ip_address(str(value).strip())
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _ip_version(value: Any) -> int:
+        try:
+            return _ipaddress.ip_address(str(value).strip()).version
+        except ValueError as exc:
+            raise EasyScriptError(f"Ongeldig IP-adres: {value!r}") from exc
+
+    @staticmethod
+    def _ip_private(value: Any) -> bool:
+        try:
+            return _ipaddress.ip_address(str(value).strip()).is_private
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _ip_public(value: Any) -> bool:
+        try:
+            return _ipaddress.ip_address(str(value).strip()).is_global
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _set_item(container: Any, key: Any, value: Any) -> Any:
+        container[key] = value; return container
+
+    @staticmethod
+    def _delete_item(container: Any, key: Any) -> Any:
+        del container[key]; return container
+
+    @staticmethod
+    def _append(seq: Any, value: Any) -> Any:
+        seq.append(value); return seq
+
+    @staticmethod
+    def _extend(seq: Any, values: Any) -> Any:
+        seq.extend(values); return seq
+
+    @staticmethod
+    def _insert(seq: Any, index: Any, value: Any) -> Any:
+        seq.insert(int(index), value); return seq
+
+    @staticmethod
+    def _pop(seq: Any, index: Any = -1) -> Any:
+        return seq.pop(int(index))
+
+    @staticmethod
+    def _remove(seq: Any, value: Any) -> Any:
+        seq.remove(value); return seq
+
+    @staticmethod
+    def _clear(value: Any) -> None:
+        value.clear(); return None
+
+    @staticmethod
+    def _shuffle(seq: Any) -> Any:
+        random.shuffle(seq); return seq
+
+    def _date_format(self, fmt: str = "%Y-%m-%d %H:%M:%S", timestamp: Any = None) -> str:
+        dt = _datetime.datetime.fromtimestamp(float(timestamp)) if timestamp is not None else _datetime.datetime.now()
+        return dt.strftime(str(fmt))
+
+    def _read_text(self, filename: Any) -> str:
+        with open(self.resolve_path(filename), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def _write_text(self, filename: Any, content: Any) -> int:
+        with open(self.resolve_path(filename), "w", encoding="utf-8") as handle:
+            return handle.write(str(content))
+
+    def _append_text(self, filename: Any, content: Any) -> int:
+        with open(self.resolve_path(filename), "a", encoding="utf-8") as handle:
+            return handle.write(str(content))
+
+    @staticmethod
+    def _print_builtin(*values: Any, sep: str = " ", end: str = "\n") -> None:
+        print(*values, sep=sep, end=end); return None
+
+    @staticmethod
+    def _assert_true(condition: Any, message: str = "Assertion failed") -> bool:
+        if not condition: raise EasyScriptError(str(message))
+        return True
+
+    def _resolve_function_argument(self, value: Any) -> Any:
+        if isinstance(value, (EasyFunction,)) or callable(value): return value
+        name = str(value)
+        fn = self.functions.get(name)
+        if fn is None: fn = self.functions.get(name.lower())
+        if fn is None: fn = self.builtins.get(name.lower())
+        if fn is None: raise EasyScriptError(f"Onbekende EasyScript-functie: {name}")
+        return fn
+
+    def _map_to(self, function_name: Any, iterable: Any) -> list[Any]:
+        fn = self._resolve_function_argument(function_name)
+        return [self.call_value(fn, [item]) for item in iterable]
+
+    def _filter_by(self, function_name: Any, iterable: Any) -> list[Any]:
+        fn = self._resolve_function_argument(function_name)
+        return [item for item in iterable if self.call_value(fn, [item])]
+
+    def _reduce_by(self, function_name: Any, iterable: Any, initial: Any = ...) -> Any:
+        fn = self._resolve_function_argument(function_name)
+        iterator = iter(iterable)
+        if initial is ...:
+            try: result = next(iterator)
+            except StopIteration as exc: raise EasyScriptError("REDUCE cannot process an empty list without an initial value") from exc
+        else: result = initial
+        for item in iterator: result = self.call_value(fn, [result, item])
+        return result
+
+    @staticmethod
+    def _is_callable(value: Any) -> bool:
+        return isinstance(value, EasyFunction) or callable(value)
+
+    @staticmethod
+    def _is_subclass_type(child: Any, parent: Any) -> bool:
+        known_types = {
+            "object": object, "none": type(None), "nonetype": type(None),
+            "bool": bool, "int": int, "float": float, "complex": complex,
+            "str": str, "string": str, "list": list, "tuple": tuple,
+            "dict": dict, "set": set, "frozenset": frozenset,
+            "bytes": bytes, "bytearray": bytearray,
+        }
+        child_type = child if isinstance(child, type) else known_types.get(str(child).lower())
+        parent_type = parent if isinstance(parent, type) else known_types.get(str(parent).lower())
+        if child_type is None or parent_type is None:
+            raise EasyScriptError("IS_SUBCLASS verwacht bekende types zoals \"int\", \"float\" of \"object\"")
+        return issubclass(child_type, parent_type)
+
+    @staticmethod
+    def _next_item(iterator: Any, default: Any = ... ) -> Any:
+        if default is ...: return next(iterator)
+        return next(iterator, default)
+
+    def _dir(self, value: Any = None) -> list[str]:
+        if value is None:
+            keys = set(self.variables) | set(self.functions) | set(self.builtins)
+            for scope in self.scopes: keys.update(scope)
+            return sorted(keys)
+        if isinstance(value, dict): return sorted(map(str, value.keys()))
+        if isinstance(value, (list, tuple, str, set, frozenset)): return ["count", "index", "length"] if not isinstance(value, (set, frozenset)) else ["add", "discard", "remove"]
+        return ["type"]
+
+    def _globals(self) -> dict[str, Any]:
+        return dict(self.variables)
+
+    def _locals(self) -> dict[str, Any]:
+        return dict(self.scopes[-1]) if self.scopes else dict(self.variables)
+
+    # ----------------------------- line parsing -----------------------------
+    @staticmethod
+    def split_args(source: str) -> list[str]:
+        """Split comma-separated arguments while respecting quotes and brackets."""
+        args, start = [], 0
+        stack: list[str] = []
+        quote: str | None = None
+        escaped = False
+        matching = {")": "(", "]": "[", "}": "{"}
+        for i, char in enumerate(source):
+            if quote:
+                if escaped: escaped = False
+                elif char == "\\": escaped = True
+                elif char == quote: quote = None
+                continue
+            if char in ('"', "'"):
+                quote = char
+            elif char in "([{":
+                stack.append(char)
+            elif char in ")]}":
+                if stack and stack[-1] == matching[char]: stack.pop()
+            elif char == "," and not stack:
+                args.append(source[start:i].strip()); start = i + 1
+        tail = source[start:].strip()
+        if tail or source.strip(): args.append(tail)
+        return args
+
+    @staticmethod
+    def command_parts(line: str) -> tuple[str, str] | None:
+        match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\[(.*)\]\s*$", line, re.S)
+        if not match: return None
+        return match.group(1).upper(), match.group(2).strip()
+
+    @staticmethod
+    def _block_start(line: str) -> str | None:
+        s = line.strip().upper()
+        for name in ("IF", "WHILE", "FOR", "FOREACH", "FUNCTION", "TRY"):
+            if s == name or s.startswith(name + "["):
+                return name
+        return None
+
+    @staticmethod
+    def _block_end(name: str) -> str:
+        return {"IF": "ENDIF", "WHILE": "ENDWHILE", "FOR": "ENDFOR", "FOREACH": "ENDFOREACH", "FUNCTION": "ENDFUNCTION", "TRY": "ENDTRY"}[name]
+
+    @staticmethod
+    def _line_command_name(line: str) -> str:
+        s = line.strip().upper()
+        parts = EasyScriptRuntime.command_parts(s)
+        return parts[0] if parts else s.split(maxsplit=1)[0] if s else ""
+
+    def find_block(self, lines: list[str], start: int, end: int, wanted: str, clauses: set[str] | None = None) -> tuple[list[tuple[int, str]], int]:
+        """Find top-level block clauses and matching end, respecting nested blocks."""
+        stack = [self._block_end(wanted)]
+        found: list[tuple[int, str]] = []
+        clauses = clauses or set()
+        for i in range(start + 1, end):
+            name = self._line_command_name(lines[i])
+            opener = self._block_start(lines[i])
+            if opener:
+                stack.append(self._block_end(opener))
+                continue
+            if name in {"ENDIF", "ENDWHILE", "ENDFOR", "ENDFOREACH", "ENDFUNCTION", "ENDTRY"}:
+                if stack and name == stack[-1]:
+                    stack.pop()
+                    if not stack:
+                        return found, i
+                continue
+            if len(stack) == 1 and name in clauses:
+                found.append((i, name))
+        raise EasyScriptError(f"Block {wanted} on line {start + 1} has no closing {self._block_end(wanted)}")
+
+    def execute_range(self, lines: list[str], start: int = 0, end: int | None = None) -> None:
+        if end is None: end = len(lines)
+        i = start
+        while i < end:
+            raw = lines[i]
+            line_no = i + 1
+            line = raw.strip()
+            if not line or line.startswith("#") or line.upper().startswith("REM "):
+                i += 1; continue
+            name = self._line_command_name(line)
+            try:
+                if name == "IF":
+                    clauses, close = self.find_block(lines, i, end, "IF", {"ELIF", "ELSE"})
+                    branches = [(i, "IF")] + clauses
+                    chosen: tuple[int, int] | None = None
+                    for j, (clause_i, clause_name) in enumerate(branches):
+                        stop = branches[j + 1][0] if j + 1 < len(branches) else close
+                        if clause_name == "ELSE":
+                            chosen = (clause_i + 1, stop); break
+                        clause_line = lines[clause_i].strip()
+                        condition = self._bracket_content(clause_line, clause_name)
+                        if bool(self.eval_expr(condition)):
+                            chosen = (clause_i + 1, stop); break
+                    if chosen: self.execute_range(lines, chosen[0], chosen[1])
+                    i = close + 1; continue
+                if name == "WHILE":
+                    _, close = self.find_block(lines, i, end, "WHILE")
+                    condition = self._bracket_content(line, "WHILE")
+                    body = lines[i + 1:close]
+                    count = 0
+                    while self.eval_expr(condition):
+                        count += 1
+                        if count > self.loop_limit: raise EasyScriptError("WHILE is gestopt: luslimiet bereikt")
+                        try: self.execute_range(body, 0, len(body))
+                        except ContinueSignal: continue
+                        except BreakSignal: break
+                    i = close + 1; continue
+                if name == "FOR":
+                    _, close = self.find_block(lines, i, end, "FOR")
+                    args = self.split_args(self._bracket_content(line, "FOR"))
+                    if len(args) not in (2, 3, 4): raise EasyScriptError("Use FOR[variable, count] or FOR[variable, start, stop, step]")
+                    variable = args[0].strip()
+                    values = self.eval_expr(args[1]) if len(args) == 2 else None
+                    if len(args) == 2:
+                        if isinstance(values, int): values = range(values)
+                        try: iterator = iter(values)
+                        except TypeError as exc: raise EasyScriptError("FOR expects a number or iterable list") from exc
+                    else:
+                        first, stop = int(self.eval_expr(args[1])), int(self.eval_expr(args[2]))
+                        step = int(self.eval_expr(args[3])) if len(args) == 4 else 1
+                        if step == 0: raise EasyScriptError("FOR-stap mag niet nul zijn")
+                        iterator = iter(range(first, stop, step))
+                    body = lines[i + 1:close]
+                    for value in iterator:
+                        self.set_var(variable, value)
+                        try: self.execute_range(body, 0, len(body))
+                        except ContinueSignal: continue
+                        except BreakSignal: break
+                    i = close + 1; continue
+                if name == "FOREACH":
+                    _, close = self.find_block(lines, i, end, "FOREACH")
+                    args = self.split_args(self._bracket_content(line, "FOREACH"))
+                    if len(args) != 2: raise EasyScriptError("Use FOREACH[variable, list]")
+                    var = args[0].strip(); values = self.eval_expr(args[1])
+                    body = lines[i + 1:close]
+                    for value in values:
+                        self.set_var(var, value)
+                        try: self.execute_range(body, 0, len(body))
+                        except ContinueSignal: continue
+                        except BreakSignal: break
+                    i = close + 1; continue
+                if name == "FUNCTION":
+                    _, close = self.find_block(lines, i, end, "FUNCTION")
+                    args = self.split_args(self._bracket_content(line, "FUNCTION"))
+                    if not args or not args[0]: raise EasyScriptError("Use FUNCTION[name, parameter1, parameter2]")
+                    fn_name = args[0].strip()
+                    params: list[str] = []
+                    defaults: dict[str, Any] = {}
+                    saw_default = False
+                    for raw_param in args[1:]:
+                        if not raw_param: continue
+                        if "=" in raw_param:
+                            param, default_source = raw_param.split("=", 1)
+                            param = param.strip()
+                            if not default_source.strip(): raise EasyScriptError(f"No default value for parameter {param}")
+                            defaults[param] = self.eval_expr(default_source.strip())
+                            saw_default = True
+                        else:
+                            param = raw_param.strip()
+                            if saw_default: raise EasyScriptError("Parameters without default values must come before parameters with defaults")
+                        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", param): raise EasyScriptError("Invalid function name or parameter")
+                        if param in params: raise EasyScriptError(f"Dubbele parameter: {param}")
+                        params.append(param)
+                    self.functions[fn_name] = EasyFunction(fn_name, params, defaults, lines[i + 1:close])
+                    i = close + 1; continue
+                if name == "TRY":
+                    clauses, close = self.find_block(lines, i, end, "TRY", {"CATCH", "FINALLY"})
+                    catch_i = next((ci for ci, cn in clauses if cn == "CATCH"), None)
+                    finally_i = next((ci for ci, cn in clauses if cn == "FINALLY"), None)
+                    try_end = min([x for x in (catch_i, finally_i, close) if x is not None])
+                    self.try_depth += 1
+                    try:
+                        try:
+                            self.execute_range(lines, i + 1, try_end)
+                        except (BreakSignal, ContinueSignal, ReturnSignal):
+                            raise
+                        except Exception as exc:
+                            if catch_i is None: raise
+                            catch_end = finally_i if finally_i is not None and finally_i > catch_i else close
+                            cargs = self.split_args(self._bracket_content(lines[catch_i].strip(), "CATCH")) if "[" in lines[catch_i] else []
+                            if cargs and cargs[0]: self.set_var(cargs[0].strip(), str(exc))
+                            self.execute_range(lines, catch_i + 1, catch_end)
+                    finally:
+                        self.try_depth -= 1
+                        if finally_i is not None:
+                            self.execute_range(lines, finally_i + 1, close)
+                    i = close + 1; continue
+
+                self.execute_statement(line, line_no)
+                i += 1
+            except (BreakSignal, ContinueSignal, ReturnSignal):
+                raise
+            except Exception as exc:
+                if self.try_depth == 0:
+                    print(f"{RED}[EasyScript regel {line_no}] {exc}{RESET}")
+                raise
+
+    @staticmethod
+    def _bracket_content(line: str, expected: str | None = None) -> str:
+        m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\[(.*)\]\s*:?\s*$", line, re.S)
+        if not m: raise EasyScriptError(f"Ongeldige syntax: {line}")
+        if expected and m.group(1).upper() != expected.upper(): raise EasyScriptError(f"Verwacht {expected}[...]")
+        return m.group(2).strip()
+
+    def eval_legacy_value(self, text: str) -> Any:
+        text = text.strip()
+        if text in self.variables: return self.variables[text]
+        if self.scopes and text in self.scopes[-1]: return self.scopes[-1][text]
+        try:
+            return self.eval_expr(text)
+        except Exception:
+            if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+                return _decode_string(text)
+            # Bare unquoted text is accepted by older EasyScript commands. Do not
+            # swallow real expression errors such as division by zero or bad indexes.
+            looks_like_expression = (
+                any(op in text for op in ("==", "!=", "<=", ">=", "**", "//", "+", "*", "/", "%", "<", ">", "[", "]", "(", ")"))
+                or bool(re.search(r"\b(and|or|not|in)\b", text, re.I))
+            )
+            if looks_like_expression:
+                raise
+            return text
+
+    def execute_statement(self, line: str, line_no: int = 0) -> bool:
+        upper = line.upper().strip()
+        if upper in ("BREAK", "STOPLOOP"):
+            raise BreakSignal()
+        if upper in ("CONTINUE", "NEXTITERATION"):
+            raise ContinueSignal()
+        if upper in ("RETURN", "RETURN[]"):
+            raise ReturnSignal(None)
+        if upper.startswith("RETURN[") and line.endswith("]"):
+            raise ReturnSignal(self.eval_expr(self._bracket_content(line, "RETURN")))
+        if upper in ("CLEAR", "CLS"):
+            os.system("cls" if os.name == "nt" else "clear"); return True
+        if upper == "HELP": self.print_help(); return True
+        if upper == "VARS":
+            print(f"\n{YELLOW}--- ACTIEVE VARIABELEN ---{RESET}")
+            combined = dict(self.variables)
+            if self.scopes: combined.update(self.scopes[-1])
+            for key, value in combined.items(): print(f"  {CYAN}{key}{RESET} = {GREEN}{value!r}{RESET}")
+            if not combined: print("  (Geen variabelen ingesteld)")
+            print(f"{YELLOW}--------------------------{RESET}\n"); return True
+        if upper in ("IPCONFIG", "WHOAMI", "TIME", "DATE", "SYSINFO", "DIR"):
+            return self.execute_system_command(upper)
+        if upper in ("ELSE", "ENDIF", "ENDWHILE", "ENDFOR", "ENDFOREACH", "ENDFUNCTION", "ENDTRY", "FINALLY") or upper.startswith("ELIF[") or upper.startswith("CATCH["):
+            raise EasyScriptError(f"{upper} may only appear inside its matching block")
+
+        # Indexed assignment: list[0] = value or dictionary["key"] = value.
+        indexed_assignment = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\[(.+)\]\s*(\+=|-=|\*=|/=|%=|=)\s*(.*?)\s*$", line, re.S)
+        if indexed_assignment:
+            root_name, index_source, operator, expression = indexed_assignment.groups()
+            target = self.resolve_name(root_name)
+            key = self.eval_expr(index_source)
+            value = self.eval_legacy_value(expression)
+            if operator != "=":
+                value = ExpressionParser.apply_operator(operator[:-1], target[key], value)
+            target[key] = value
+            return True
+
+        # Variable assignment and update: x = expression, x += expression, etc.
+        assignment = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(\+=|-=|\*=|/=|%=|=)\s*(.*?)\s*$", line, re.S)
+        if assignment and not upper.startswith(("IF[", "WHILE[", "FOR[", "FOREACH[", "FUNCTION[")):
+            name, operator, expression = assignment.groups()
+            expression = expression[:-1].rstrip() if expression.endswith(":") and "INPUT[" in expression.upper() else expression
+            if expression.upper().startswith("INPUT["):
+                prompt = self._bracket_content(expression, "INPUT")
+                val = input(str(self.eval_legacy_value(prompt)) + " ")
+            elif expression.upper().startswith("READ["):
+                filename = self._bracket_content(expression, "READ").strip('"').strip("'")
+                with open(self.resolve_path(filename), "r", encoding="utf-8") as handle: val = handle.read()
+            else:
+                val = self.eval_legacy_value(expression)
+            if operator != "=":
+                current = self.resolve_name(name)
+                symbol = operator[:-1]
+                val = ExpressionParser.apply_operator(symbol, current, val)
+            self.set_var(name, val); return True
+
+        parts = self.command_parts(line)
+        if parts:
+            cmd, content = parts
+            args = self.split_args(content)
+            if cmd in ("DNS", "DNS_LOOKUP"):
+                host = self.eval_legacy_value(content)
+                print(self._dns_lookup(host)); return True
+            if cmd == "TCP_CHECK":
+                if len(args) not in (2, 3): raise EasyScriptError("Use TCP_CHECK[host, port, timeout]")
+                values = [self.eval_legacy_value(a) for a in args]
+                print(self._tcp_check(*values)); return True
+            if cmd == "HTTP_GET":
+                if len(args) not in (1, 2, 3): raise EasyScriptError("Use HTTP_GET[url, timeout, headers]")
+                values = [self.eval_legacy_value(a) for a in args]
+                print(self._http_get(*values)); return True
+            if cmd == "HTTP_POST":
+                if len(args) < 2 or len(args) > 5: raise EasyScriptError("Use HTTP_POST[url, body, content_type, timeout, headers]")
+                values = [self.eval_legacy_value(a) for a in args]
+                print(json.dumps(self._http_post(*values), ensure_ascii=False, indent=2)); return True
+            if cmd == "HTTP_REQUEST":
+                if len(args) < 1 or len(args) > 5: raise EasyScriptError("Use HTTP_REQUEST[url, method, body, headers, timeout]")
+                values = [self.eval_legacy_value(a) for a in args]
+                print(json.dumps(self._http_request(*values), ensure_ascii=False, indent=2)); return True
+            if cmd == "TEXT":
+                try:
+                    value = self.eval_expr(content)
+                except Exception:
+                    # Version 2.x also allowed unquoted pieces joined with +, e.g. TEXT[Hello + name].
+                    chunks = self._split_top_level_plus(content)
+                    if len(chunks) > 1:
+                        value = "".join(str(self.eval_legacy_value(chunk)) for chunk in chunks)
+                    else:
+                        value = self.eval_legacy_value(content)
+                print(value); return True
+            if cmd == "EVAL":
+                # Kept for compatibility, but expressions are EasyScript only (never Python eval).
+                print(self.eval_expr(content)); return True
+            if cmd == "LEN": print(len(self.eval_legacy_value(content))); return True
+            if cmd == "UPPER": print(str(self.eval_legacy_value(content)).upper()); return True
+            if cmd == "LOWER": print(str(self.eval_legacy_value(content)).lower()); return True
+            if cmd == "ABS": print(abs(float(self.eval_legacy_value(content)))); return True
+            if cmd == "ROUND": print(round(float(self.eval_legacy_value(content)))); return True
+            if cmd == "RANDOM":
+                if len(args) == 2: print(random.randint(int(self.eval_legacy_value(args[0])), int(self.eval_legacy_value(args[1]))))
+                else: print(random.randint(0, 100))
+                return True
+            if cmd in ("DEL", "DELETE"):
+                filename = content.strip().strip('"').strip("'"); path = self.resolve_path(filename)
+                if os.path.exists(path): os.remove(path); print(f"{GREEN}[DELETED]: {filename}{RESET}")
+                else: print(f"{RED}[ERROR] File {filename!r} not found.{RESET}")
+                return True
+            if cmd == "MKDIR":
+                path = self.resolve_path(content.strip().strip('"').strip("'")); os.makedirs(path, exist_ok=True); print(f"{GREEN}[FOLDER CREATED]: {path}{RESET}"); return True
+            if cmd == "READ":
+                filename = content.strip().strip('"').strip("'"); path = self.resolve_path(filename)
+                with open(path, "r", encoding="utf-8") as handle: print(handle.read().rstrip("\n"))
+                return True
+            if cmd == "WRITE": return self._write_command(args, content, line_no)
+            if cmd == "RUN":
+                filename = content.strip().strip('"').strip("'"); path = self.resolve_path(filename)
+                with open(path, "r", encoding="utf-8") as handle: self.run_script(handle.readlines())
+                return True
+            if cmd == "TYPE":
+                if PYAUTOGUI_AVAILABLE: pyautogui.write(str(self.eval_legacy_value(content.strip().strip('"').strip("'"))), interval=0.02)
+                else: print(f"{YELLOW}[WAARSCHUWING] PyAutoGUI is niet geïnstalleerd.{RESET}")
+                return True
+            if cmd == "PRESS":
+                if PYAUTOGUI_AVAILABLE: pyautogui.press(str(self.eval_legacy_value(content.strip().strip('"').strip("'")).lower()))
+                else: print(f"{YELLOW}[WAARSCHUWING] PyAutoGUI is niet geïnstalleerd.{RESET}")
+                return True
+            if cmd == "CMD":
+                command = content.strip().strip('"').strip("'")
+                print(f"{GREEN}[CMD]: {command}{RESET}"); subprocess.Popen(command, shell=True); return True
+            if cmd == "PING":
+                host = str(self.eval_legacy_value(content.strip().strip('"').strip("'")))
+                param = "-n" if os.name == "nt" else "-c"
+                subprocess.run(["ping", param, "2", host], check=False); return True
+            if cmd == "SLEEP": time.sleep(float(self.eval_legacy_value(content))); return True
+            if cmd == "DELVAR":
+                name = content.strip()
+                scope = self.scopes[-1] if self.scopes and name in self.scopes[-1] else self.variables
+                if name not in scope: raise EasyScriptError(f"Onbekende variabele: {name}")
+                del scope[name]; return True
+            if cmd == "SETITEM":
+                if len(args) != 3: raise EasyScriptError("Use SETITEM[collection, key, value]")
+                self._set_item(self.eval_legacy_value(args[0]), self.eval_legacy_value(args[1]), self.eval_legacy_value(args[2])); return True
+            if cmd == "DELITEM":
+                if len(args) != 2: raise EasyScriptError("Use DELITEM[collection, key]")
+                self._delete_item(self.eval_legacy_value(args[0]), self.eval_legacy_value(args[1])); return True
+            if cmd == "SET":
+                if len(args) != 2: raise EasyScriptError("Use SET[name, value]")
+                self.set_var(args[0].strip(), self.eval_legacy_value(args[1])); return True
+            if cmd == "GET": print(self.resolve_name(content.strip())); return True
+            if cmd == "APPEND":
+                if len(args) != 2: raise EasyScriptError("Use APPEND[list, value]")
+                self._append(self.eval_legacy_value(args[0]), self.eval_legacy_value(args[1])); return True
+            if cmd == "INSERT":
+                if len(args) != 3: raise EasyScriptError("Use INSERT[list, position, value]")
+                self._insert(self.eval_legacy_value(args[0]), self.eval_legacy_value(args[1]), self.eval_legacy_value(args[2])); return True
+            if cmd == "POP":
+                values = [self.eval_legacy_value(a) for a in args]; print(self._pop(*values)); return True
+            if cmd == "REMOVE":
+                if len(args) != 2: raise EasyScriptError("Use REMOVE[list, value]")
+                self._remove(self.eval_legacy_value(args[0]), self.eval_legacy_value(args[1])); return True
+            if cmd == "SORT":
+                values = self.eval_legacy_value(content)
+                values.sort(); print(values); return True
+            if cmd == "REVERSE":
+                values = self.eval_legacy_value(content)
+                values.reverse(); print(values); return True
+            if cmd == "JSON":
+                if not args: raise EasyScriptError("Use JSON[value] or JSON[value, pretty]")
+                value = self.eval_legacy_value(args[0]); pretty = bool(self.eval_legacy_value(args[1])) if len(args) > 1 else False
+                print(json.dumps(value, ensure_ascii=False, indent=2 if pretty else None)); return True
+            if cmd == "ASSERT":
+                if not args: raise EasyScriptError("Use ASSERT[condition, message]")
+                if not self.eval_expr(args[0]): raise EasyScriptError(str(self.eval_legacy_value(args[1])) if len(args) > 1 else "ASSERT failed")
+                return True
+            if cmd == "RAISE": raise EasyScriptError(str(self.eval_legacy_value(content)))
+            if cmd == "REMOTE_SERVER":
+                if len(args) not in (2, 3):
+                    raise EasyScriptError('Use REMOTE_SERVER[port, "long-secret", "shared_folder"]')
+                port = int(self.eval_legacy_value(args[0]))
+                token = str(self.eval_legacy_value(args[1]))
+                folder = str(self.eval_legacy_value(args[2])) if len(args) == 3 else "EasyShared"
+                self.start_remote_file_server(port, token, folder)
+                return True
+            if cmd == "REMOTE_LIST":
+                if len(args) not in (2, 3): raise EasyScriptError('Use REMOTE_LIST["ip:port", "secret", "folder"]')
+                host = str(self.eval_legacy_value(args[0])); token = str(self.eval_legacy_value(args[1]))
+                folder = str(self.eval_legacy_value(args[2])) if len(args) == 3 else ""
+                print(json.dumps(self.remote_file_request(host, token, "LIST", folder), ensure_ascii=False, indent=2)); return True
+            if cmd == "REMOTE_READ":
+                if len(args) != 3: raise EasyScriptError('Use REMOTE_READ["ip:port", "secret", "file.easy"]')
+                host, token, filename = [str(self.eval_legacy_value(a)) for a in args]
+                print(self.remote_file_request(host, token, "READ", filename)); return True
+            if cmd == "REMOTE_WRITE":
+                if len(args) != 4: raise EasyScriptError('Use REMOTE_WRITE["ip:port", "secret", "file.easy", content]')
+                host, token, filename = [str(self.eval_legacy_value(a)) for a in args[:3]]
+                content = str(self.eval_legacy_value(args[3]))
+                result = self.remote_file_request(host, token, "WRITE", filename, content)
+                print(f"{GREEN}[REMOTE WRITE] {result.get('message', 'File saved')}{RESET}"); return True
+            if cmd == "REMOTE_EDIT":
+                if len(args) not in (3, 4): raise EasyScriptError('Use REMOTE_EDIT["ip:port", "secret", "file.easy", "local_copy.easy"]')
+                host, token, filename = [str(self.eval_legacy_value(a)) for a in args[:3]]
+                local_filename = str(self.eval_legacy_value(args[3])) if len(args) == 4 else None
+                self.remote_edit_file(host, token, filename, local_filename); return True
+            if cmd == "SERVER":
+                port = int(self.eval_legacy_value(content)); t = threading.Thread(target=self.start_target_server, args=(port,), daemon=True); t.start(); return True
+            if cmd == "SEND":
+                if len(args) >= 2: self.send_to_target(str(self.eval_legacy_value(args[0])), str(self.eval_legacy_value(",".join(args[1:]))))
+                else: raise EasyScriptError("Use SEND[ip:port, command]")
+                return True
+
+        # DuckyScript commands (kept for existing .txt/.duck scripts).
+        if self.execute_duckscript_line(line, line_no): return True
+        raise EasyScriptError(f"Unknown Command: {line}")
+
+    @staticmethod
+    def _split_top_level_plus(source: str) -> list[str]:
+        pieces, start = [], 0
+        stack: list[str] = []
+        quote: str | None = None
+        escaped = False
+        matching = {")": "(", "]": "[", "}": "{"}
+        for i, char in enumerate(source):
+            if quote:
+                if escaped: escaped = False
+                elif char == "\\": escaped = True
+                elif char == quote: quote = None
+                continue
+            if char in ('\"', "'"): quote = char
+            elif char in "([{": stack.append(char)
+            elif char in ")] }".replace(" ", ""):
+                if stack and stack[-1] == matching[char]: stack.pop()
+            elif char == "+" and not stack:
+                pieces.append(source[start:i].strip()); start = i + 1
+        pieces.append(source[start:].strip())
+        return pieces
+
+    def _write_command(self, args: list[str], original: str, line_no: int) -> bool:
+        if len(args) == 3:
+            filename = str(self.eval_legacy_value(args[0])).strip('"').strip("'")
+            mode = args[1].strip()
+            value = str(self.eval_legacy_value(args[2]))
+            path = self.resolve_path(filename)
+            existing = []
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as handle: existing = [x.rstrip("\n") for x in handle.readlines()]
+            if mode == "+": existing.append(value)
+            elif re.fullmatch(r"-\d+", mode):
+                index = abs(int(mode)) - 1
+                while len(existing) <= index: existing.append("")
+                existing[index] = value
+            else: raise EasyScriptError(f"Invalid WRITE mode: {mode}. Use + or a value such as -1")
+            with open(path, "w", encoding="utf-8") as handle: handle.write("\n".join(existing) + ("\n" if existing else ""))
+            print(f"{GREEN}[WRITE] Saved: {filename}{RESET}"); return True
+        if len(args) == 2:
+            filename = str(self.eval_legacy_value(args[0])).strip('"').strip("'")
+            action = args[1].strip().strip('"').strip("'")
+            path = self.resolve_path(filename)
+            if action.lower() == "-showall":
+                with open(path, "r", encoding="utf-8") as handle:
+                    print(f"\n{YELLOW}--- INHOUD: {filename} ---{RESET}")
+                    for idx, line in enumerate(handle, 1): print(f"{CYAN}[{idx}]{RESET} {line.rstrip()}")
+                return True
+            with open(path, "w", encoding="utf-8") as handle: handle.write(str(self.eval_legacy_value(args[1])) + "\n")
+            print(f"{GREEN}[WRITE] File overwritten: {filename}{RESET}"); return True
+        raise EasyScriptError("Use WRITE[file, text], WRITE[file, +, text], or WRITE[file, -1, text]")
+
+    def execute_system_command(self, command: str) -> bool:
+        if command == "IPCONFIG":
+            program = "ipconfig" if os.name == "nt" else "ifconfig"
+            if os.name != "nt" and shutil.which(program) is None and shutil.which("ip"):
+                program = "ip"
+                subprocess.run([program, "addr"], check=False)
+            else: subprocess.run(program, shell=True, check=False)
+        elif command == "WHOAMI": print(f"Current User: {CYAN}{getpass.getuser()}{RESET}")
+        elif command == "TIME": print(f"Current Time: {CYAN}{_datetime.datetime.now().strftime('%H:%M:%S')}{RESET}")
+        elif command == "DATE": print(f"Current Date: {CYAN}{_datetime.date.today().isoformat()}{RESET}")
+        elif command == "SYSINFO":
+            print(f"\n{YELLOW}--- SYSTEEMINFORMATIE ---{RESET}")
+            print(f"  OS         : {platform.system()} {platform.release()}")
+            print(f"  Machine    : {platform.machine()}")
+            print(f"  Processor  : {platform.processor()}")
+            print(f"  Runtime    : EasyScript 1.0.3")
+            print(f"{YELLOW}-------------------------{RESET}\n")
+        elif command == "DIR":
+            print(f"\n{YELLOW}--- FILES IN {self.script_dir} ---{RESET}")
+            for filename in os.listdir(self.script_dir): print(f"  {CYAN}{filename}{RESET}")
+        return True
+
+    def execute_duckscript_line(self, line: str, line_no: int = 0) -> bool:
+        parts = line.split(maxsplit=1)
+        cmd = parts[0].upper() if parts else ""
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        valid = {"STRING", "DELAY", "REM", "#", "ENTER", "TAB", "SPACE", "ESCAPE", "BACKSPACE", "DELETE", "UP", "DOWN", "LEFT", "RIGHT", "HOME", "END", "GUI", "WINDOWS", "CTRL", "CONTROL", "ALT", "SHIFT"}
+        if cmd not in valid: return False
+        if cmd in ("REM", "#"): return True
+        if not PYAUTOGUI_AVAILABLE:
+            if cmd != "DELAY": print(f"{YELLOW}[WAARSCHUWING regel {line_no}] PyAutoGUI ontbreekt; toetsen worden niet verstuurd.{RESET}")
+            if cmd == "DELAY":
+                try: time.sleep(float(arg) / 1000.0)
+                except ValueError: raise EasyScriptError(f"Invalid DELAY value: {arg}")
+            return True
+        if cmd == "STRING": pyautogui.write(arg, interval=0.02)
+        elif cmd == "DELAY":
+            try: time.sleep(float(arg) / 1000.0)
+            except ValueError: raise EasyScriptError(f"Invalid DELAY value: {arg}")
+        elif cmd in {"ENTER", "TAB", "SPACE", "ESCAPE", "BACKSPACE", "DELETE", "UP", "DOWN", "LEFT", "RIGHT", "HOME", "END"}:
+            pyautogui.press(cmd.lower())
+        else:
+            key_map = {"gui": "win", "windows": "win", "ctrl": "ctrl", "control": "ctrl", "alt": "alt", "shift": "shift"}
+            main_key = key_map.get(cmd.lower(), cmd.lower())
+            if arg: pyautogui.hotkey(main_key, *[key_map.get(p.lower(), p.lower()) for p in arg.split()])
+            else: pyautogui.press(main_key)
+        return True
+
+    # Compatibility with the older TCP controller/target commands.
+    def start_target_server(self, port: int) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("0.0.0.0", int(port))); server.listen(1)
+            print(f"\n{GREEN}[TARGET ACTIVE] Poort {port} luistert op opdrachten...{RESET}")
+            while True:
+                client, _addr = server.accept()
+                with client:
+                    data = client.recv(4096).decode("utf-8", errors="replace")
+                if data.strip():
+                    try: self.execute_statement(data.strip(), 0)
+                    except Exception as exc: print(f"{RED}[SERVER ERROR] {exc}{RESET}")
+
+    @staticmethod
+    def send_to_target(target_info: str, command: str) -> None:
+        try:
+            ip, port_text = target_info.split(":", 1)
+            with socket.create_connection((ip.strip(), int(port_text.strip())), timeout=5) as conn:
+                conn.sendall(command.encode("utf-8"))
+            print(f"{GREEN}[CONTROLLER] Opdracht verzonden.{RESET}")
+        except Exception as exc:
+            print(f"{RED}[NETWORK ERROR] Connection failed: {exc}{RESET}")
+
+    # Authenticated, restricted remote .easy-file service. It never executes received code.
+    _REMOTE_MAX_BYTES = 1_500_000
+
+    @staticmethod
+    def _remote_read_exact(reader, size: int) -> bytes:
+        data = reader.read(size)
+        if len(data) != size:
+            raise EasyScriptError("Onvolledig netwerkantwoord ontvangen")
+        return data
+
+    @staticmethod
+    def _validate_remote_relative_path(relative: str, need_easy_file: bool = False) -> str:
+        relative = str(relative).replace("\\", "/")
+        pure = Path(relative)
+        parts = relative.split("/")
+        if not relative or relative.startswith("/") or pure.is_absolute() or any(part in ("..", "") for part in parts):
+            if relative not in ("", "."):
+                raise EasyScriptError("Use a relative path inside the shared folder; '..' is not allowed")
+        if relative in ("", "."):
+            if need_easy_file:
+                raise EasyScriptError("Provide a filename with the .easy extension")
+            return ""
+        if need_easy_file and not relative.lower().endswith(".easy"):
+            raise EasyScriptError("Only .easy files can be read or modified remotely")
+        return "/".join(part for part in parts if part not in ("", "."))
+
+    @staticmethod
+    def _remote_inside_root(root: Path, relative: str) -> Path:
+        candidate = (root / Path(*relative.split("/"))).resolve() if relative else root.resolve()
+        resolved_root = root.resolve()
+        if candidate != resolved_root and resolved_root not in candidate.parents:
+            raise EasyScriptError("This path is outside the shared folder")
+        return candidate
+
+    def start_remote_file_server(self, port: int, token: str, folder: str = "EasyShared") -> None:
+        if len(token) < 16:
+            raise EasyScriptError("Use a secret of at least 16 characters with REMOTE_SERVER")
+        if not 1 <= int(port) <= 65535:
+            raise EasyScriptError("Poort moet tussen 1 en 65535 liggen")
+        root = Path(self.resolve_path(folder)).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        if self.remote_server_started:
+            raise EasyScriptError("The EasyScript file server is already running in this process")
+        self.remote_server_started = True
+        thread = threading.Thread(target=self._remote_file_server, args=(int(port), token, root), daemon=True)
+        thread.start()
+        print(f"{GREEN}[REMOTE FILE SERVER] Shared .easy folder: {root}; poort: {port}{RESET}")
+        print(f"{YELLOW}Use only on a trusted local network; do not configure port forwarding.{RESET}")
+
+    def _remote_file_server(self, port: int, token: str, root: Path) -> None:
+        seen_nonces: dict[str, int] = {}
+        nonce_lock = threading.Lock()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                server.bind(("0.0.0.0", port))
+                server.listen(8)
+                server.settimeout(1.0)
+            except OSError as exc:
+                print(f"{RED}[REMOTE FILE SERVER] Could not start: {exc}{RESET}")
+                self.remote_server_started = False
+                return
+            while True:
+                try:
+                    client, address = server.accept()
+                except socket.timeout:
+                    continue
+                except OSError as exc:
+                    print(f"{RED}[REMOTE FILE SERVER] Network error: {exc}{RESET}")
+                    continue
+                with client:
+                    try:
+                        client.settimeout(10)
+                        reader = client.makefile("rb")
+                        writer = client.makefile("wb")
+                        try:
+                            raw = reader.readline(self._REMOTE_MAX_BYTES + 16_384)
+                            if not raw or len(raw) > self._REMOTE_MAX_BYTES + 16_384 or not raw.endswith(b"\n"):
+                                raise EasyScriptError("Invalid or oversized request")
+                            request = json.loads(raw.decode("utf-8"))
+                            if not isinstance(request, dict):
+                                raise EasyScriptError("Invalid request")
+                            signature = str(request.get("signature", ""))
+                            body = {key: request.get(key) for key in ("method", "path", "data", "timestamp", "nonce")}
+                            canonical = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                            expected = hmac.new(token.encode("utf-8"), canonical, "sha256").hexdigest()
+                            if not hmac.compare_digest(signature, expected):
+                                raise EasyScriptError("Authentication failed: check the shared secret")
+                            timestamp = int(body.get("timestamp", 0))
+                            nonce = str(body.get("nonce", ""))
+                            if abs(int(time.time()) - timestamp) > 90 or len(nonce) < 16:
+                                raise EasyScriptError("Request expired; check the date and time on both PCs")
+                            with nonce_lock:
+                                cutoff = int(time.time()) - 120
+                                for old_nonce in [n for n, ts in seen_nonces.items() if ts < cutoff]:
+                                    seen_nonces.pop(old_nonce, None)
+                                if nonce in seen_nonces:
+                                    raise EasyScriptError("Duplicate network request rejected")
+                                seen_nonces[nonce] = timestamp
+
+                            method = str(body.get("method", "")).upper()
+                            relative = self._validate_remote_relative_path(str(body.get("path") or ""), method in ("READ", "WRITE"))
+                            if method == "LIST":
+                                directory = self._remote_inside_root(root, relative)
+                                if not directory.is_dir():
+                                    raise EasyScriptError("The requested folder does not exist")
+                                entries = []
+                                for child in sorted(directory.iterdir(), key=lambda item: item.name.lower()):
+                                    try:
+                                        safe_child = child.resolve()
+                                        if safe_child != root and root not in safe_child.parents:
+                                            continue
+                                    except OSError:
+                                        continue
+                                    if child.is_dir():
+                                        entries.append({"name": child.name, "type": "directory"})
+                                    elif child.is_file() and child.suffix.lower() == ".easy":
+                                        entries.append({"name": child.name, "type": "file"})
+                                response = {"ok": True, "data": entries}
+                            elif method == "READ":
+                                path = self._remote_inside_root(root, relative)
+                                if not path.is_file():
+                                    raise EasyScriptError("The .easy file does not exist")
+                                content = path.read_text(encoding="utf-8")
+                                if len(content.encode("utf-8")) > self._REMOTE_MAX_BYTES:
+                                    raise EasyScriptError("This file exceeds the allowed size limit")
+                                response = {"ok": True, "data": content}
+                            elif method == "WRITE":
+                                path = self._remote_inside_root(root, relative)
+                                content = body.get("data")
+                                if not isinstance(content, str):
+                                    raise EasyScriptError("File content must be text")
+                                encoded = content.encode("utf-8")
+                                if len(encoded) > self._REMOTE_MAX_BYTES:
+                                    raise EasyScriptError("File is too large (maximum 1.5 MB)")
+                                path.parent.mkdir(parents=True, exist_ok=True)
+                                if path.exists():
+                                    if not path.is_file():
+                                        raise EasyScriptError("Target is not a file")
+                                    shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+                                temp_path = path.with_name(path.name + ".tmp-" + secrets.token_hex(6))
+                                try:
+                                    temp_path.write_bytes(encoded)
+                                    os.replace(temp_path, path)
+                                finally:
+                                    try: temp_path.unlink(missing_ok=True)
+                                    except OSError: pass
+                                response = {"ok": True, "data": {"message": f"{relative} saved on the server"}}
+                            else:
+                                raise EasyScriptError("Unsupported file action")
+                        finally:
+                            try: reader.close()
+                            except Exception: pass
+                        writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                        writer.flush()
+                        writer.close()
+                    except Exception as exc:
+                        try:
+                            payload = {"ok": False, "error": str(exc) if isinstance(exc, EasyScriptError) else "Invalid request or server error"}
+                            client.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+                        except Exception:
+                            pass
+                        if not isinstance(exc, (EasyScriptError, json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError, TypeError)):
+                            print(f"{RED}[REMOTE FILE SERVER] Error from {address[0]}: {exc}{RESET}")
+
+    def remote_file_request(self, target_info: str, token: str, method: str, path: str = "", data: Any = None) -> Any:
+        if len(token) < 16:
+            raise EasyScriptError("The shared secret must be at least 16 characters long")
+        try:
+            host, port_text = target_info.rsplit(":", 1)
+            port = int(port_text)
+        except (ValueError, AttributeError) as exc:
+            raise EasyScriptError('Doel moet de vorm "192.168.1.20:8765" hebben') from exc
+        method = method.upper()
+        checked_path = self._validate_remote_relative_path(path, method in ("READ", "WRITE"))
+        body = {"method": method, "path": checked_path, "data": data, "timestamp": int(time.time()), "nonce": secrets.token_hex(16)}
+        canonical = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        request = dict(body, signature=hmac.new(token.encode("utf-8"), canonical, "sha256").hexdigest())
+        payload = json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n"
+        if len(payload) > self._REMOTE_MAX_BYTES + 16_384:
+            raise EasyScriptError("Network request is too large")
+        try:
+            with socket.create_connection((host.strip(), port), timeout=10) as conn:
+                conn.settimeout(15)
+                conn.sendall(payload)
+                with conn.makefile("rb") as reader:
+                    raw = reader.readline(self._REMOTE_MAX_BYTES + 16_384)
+            if not raw or not raw.endswith(b"\n"):
+                raise EasyScriptError("Geen geldig antwoord van de externe pc ontvangen")
+            response = json.loads(raw.decode("utf-8"))
+        except EasyScriptError:
+            raise
+        except Exception as exc:
+            raise EasyScriptError(f"Could not connect to {target_info}: {exc}") from exc
+        if not response.get("ok"):
+            raise EasyScriptError(str(response.get("error", "Remote request failed")))
+        return response.get("data")
+
+    def remote_edit_file(self, target_info: str, token: str, relative_filename: str, local_filename: str | None = None) -> None:
+        relative = self._validate_remote_relative_path(relative_filename, need_easy_file=True)
+        # Fetch the server's current version, then edit a matching local copy.
+        remote_content = self.remote_file_request(target_info, token, "READ", relative)
+        # By default keep the matching local copy under ./EasyShared/, mirroring the
+        # default server root. An optional fourth argument lets users choose another
+        # relative local .easy path.
+        local_relative = self._validate_remote_relative_path(local_filename or ("EasyShared/" + relative), need_easy_file=True)
+        local_path = self._remote_inside_root(Path(self.script_dir).resolve(), local_relative)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        if local_path.exists():
+            if not local_path.is_file():
+                raise EasyScriptError("The local target is not a file")
+            shutil.copy2(local_path, local_path.with_suffix(local_path.suffix + ".local.bak"))
+        local_path.write_text(remote_content, encoding="utf-8")
+        editor = os.environ.get("EASYSCRIPT_EDITOR") or os.environ.get("VISUAL") or os.environ.get("EDITOR")
+        if editor:
+            command = shlex.split(editor) + [str(local_path)]
+        elif os.name == "nt":
+            command = ["notepad.exe", str(local_path)]
+        else:
+            preferred = "nano" if shutil.which("nano") else "vi"
+            command = [preferred, str(local_path)]
+        print(f"{CYAN}[REMOTE EDIT] Lokale kopie openen: {local_path}{RESET}")
+        print(f"{YELLOW}Sla je wijzigingen op en sluit de editor om ze naar beide pc's te sturen.{RESET}")
+        try:
+            subprocess.run(command, check=False)
+        except OSError as exc:
+            raise EasyScriptError(f"Could not start the editor ({exc}). Set EASYSCRIPT_EDITOR.") from exc
+        edited_content = local_path.read_text(encoding="utf-8")
+        result = self.remote_file_request(target_info, token, "WRITE", relative, edited_content)
+        print(f"{GREEN}[REMOTE EDIT] File saved on this PC and the remote PC: {result['message']}{RESET}")
+
+    def run_script(self, lines: list[str]) -> None:
+        self.execute_range(lines, 0, len(lines))
+
+    def print_help(self) -> None:
+        print(f"\n{YELLOW}{'=' * 76}{RESET}")
+        print(f"{BOLD}                 EASYSCRIPT 3.2 — HELP & COMMANDS{RESET}")
+        print(f"{YELLOW}{'=' * 76}{RESET}")
+        groups = [
+            ("Basics", ["TEXT[expression] — print text or a value", "x = expression — create/update a variable", "INPUT[\"prompt\"] — request input", "VARS / GET[name] / SET[name, value] — inspect and update variables", "HELP / CLEAR / CLS / EXIT / QUIT"]),
+            ("Language structures", ["IF[condition] ... ELIF[condition] ... ELSE ... ENDIF", "WHILE[condition] ... ENDWHILE", "FOR[i, 0, 5] ... ENDFOR (stop value is exclusive)", "FOREACH[item, list] ... ENDFOREACH", "FUNCTION[name, a, b] ... RETURN[expression] ... ENDFUNCTION", "TRY ... CATCH[error] ... FINALLY ... ENDTRY", "BREAK / CONTINUE / ASSERT[condition, message] / RAISE[message]"]),
+            ("Expressions and values", ["Numbers, strings, True/False/None, arithmetic, comparisons, AND/OR/NOT", "Lists [1, 2], dictionaries {\"name\": \"Ada\"}, indexing and slicing", "LEN, STR, INT, FLOAT, BOOL, TYPE, MIN, MAX, SUM, SORTED, RANGE, ZIP, ENUMERATE", "UPPER, LOWER, TITLE, STRIP, REPLACE, SPLIT, JOIN, STARTSWITH, ENDSWITH", "SQRT, SIN, COS, TAN, LOG, FACTORIAL, GCD, CLAMP, RANDOM, RANDINT, CHOICE, SHUFFLE", "TODAY, NOW, DATE_FORMAT, SLEEP, JSON_PARSE, JSON_STRINGIFY, REGEX_SEARCH/REPLACE", "READ_TEXT, WRITE_TEXT, APPEND_TEXT, EXISTS, LISTDIR, MKDIR, COPY_FILE, MOVE_FILE, JOIN_PATH"]),
+            ("Network functions", ["DNS_LOOKUP(host) — resolve a hostname to IP addresses", "HOSTNAME() / LOCAL_IP() — computer name and local network address", "TCP_CHECK(host, port, timeout) — check whether a TCP port is reachable", "HTTP_GET(url, timeout) — fetch an HTTP/HTTPS page", "HTTP_POST(url, body, content_type, timeout) — send data to an HTTP endpoint", "HTTP_REQUEST(url, method, body, headers, timeout) — return status, headers, and body", "URL_ENCODE, URL_DECODE, URL_JOIN, URL_QUERY — build and encode URLs", "IS_IP, IP_VERSION, IP_PRIVATE, IP_PUBLIC — inspect IP addresses"]),
+            ("Remote .easy files", ["PC2: REMOTE_SERVER[port, secret, shared_folder] — serves .easy files only", "PC1: REMOTE_LIST[host:port, secret, folder] — list shared files", "REMOTE_READ[host:port, secret, file.easy] — read remote code", "REMOTE_EDIT[host:port, secret, file.easy] — edit a local copy from ./EasyShared/ and sync it back", "REMOTE_EDIT[host:port, secret, remote.easy, local.easy] — choose the local copy", "REMOTE_WRITE[host:port, secret, file.easy, content] — write a remote file (creates it if missing)", "Use a secret of at least 16 characters on a trusted LAN only; do not configure port forwarding."]),
+            ("Existing EasyScript commands", ["WRITE[file, +, text] / WRITE[file, -1, text] / WRITE[file, -showall]", "READ[file] / RUN[file] / DEL[file] / DELETE[file] / MKDIR[folder]", "CMD[command] / PING[host] / IPCONFIG / WHOAMI / TIME / DATE / SYSINFO / DIR", "LEN[value] / UPPER[value] / LOWER[value] / ABS[value] / ROUND[value] / RANDOM[min,max]", "TYPE[text] / PRESS[key] / SERVER[port] / SEND[ip:port, command]", "DuckyScript: STRING, DELAY, ENTER, TAB, SPACE, ESCAPE, CTRL, ALT, SHIFT, GUI, ..."]),
+        ]
+        for title, lines in groups:
+            print(f"\n{MAGENTA}{title}{RESET}")
+            for item in lines: print(f"  {CYAN}{item}{RESET}")
+        print(f"\n{YELLOW}Note: EasyScript does not execute Python code. EVAL[...] uses the built-in EasyScript expression parser. .easy files can be launched directly as scripts.{RESET}\n")
+
+
+def main() -> int:
+    script_path = os.path.abspath(sys.argv[0]) if sys.argv and os.path.isfile(sys.argv[0]) else __file__
+    runtime = EasyScriptRuntime(script_path)
+    print(f"{CYAN}EasyScript 3.2 — remote .easy editing, authenticated file server, networking, and DuckyScript{RESET}")
+    if len(sys.argv) > 1:
+        filename = runtime.resolve_path(sys.argv[1])
+        if not os.path.isfile(filename):
+            print(f"{RED}[ERROR] File not found: {filename}{RESET}"); return 2
+        print(f"{YELLOW}Running script: {filename}{RESET}")
+        try:
+            with open(filename, "r", encoding="utf-8") as handle: runtime.run_script(handle.readlines())
+        except Exception:
+            traceback.print_exc(); return 1
+        if runtime.remote_server_started:
+            print(f"{GREEN}[REMOTE FILE SERVER] Draait op de achtergrond. Druk Ctrl+C om te stoppen.{RESET}")
+            try:
+                while runtime.remote_server_started: time.sleep(1)
+            except KeyboardInterrupt:
+                print(f"\n{YELLOW}Remote file server stopped.{RESET}")
+        return 0
+    print(f'Type {YELLOW}"HELP"{RESET} for help or {YELLOW}"EXIT"{RESET} to exit.\n')
+    line_no = 1
+    block_lines: list[str] = []
+    block_stack: list[str] = []
+    while True:
+        try:
+            prompt = "... " if block_lines else ">>> "
+            line = input(f"{CYAN}{prompt}{RESET}")
+            command = line.strip().upper()
+            if command in ("EXIT", "QUIT") and not block_lines:
+                print(f"{YELLOW}EasyScript closed. Goodbye!{RESET}"); break
+            if not line.strip():
+                if block_lines: block_lines.append(line)
+                continue
+
+            if not block_lines:
+                opener = runtime._block_start(line)
+                if opener:
+                    block_lines.append(line)
+                    block_stack.append(runtime._block_end(opener))
+                    continue
+                try:
+                    runtime.execute_statement(line, line_no)
+                    line_no += 1
+                except (ReturnSignal, BreakSignal, ContinueSignal):
+                    print(f"{RED}BREAK/CONTINUE/RETURN cannot be used here.{RESET}")
+                except Exception as exc:
+                    print(f"{RED}[ERROR] {exc}{RESET}")
+                continue
+
+            # Multiline blocks in the REPL use the same syntax as .easy files.
+            block_lines.append(line)
+            opener = runtime._block_start(line)
+            if opener:
+                block_stack.append(runtime._block_end(opener))
+            else:
+                end_name = runtime._line_command_name(line)
+                if block_stack and end_name == block_stack[-1]:
+                    block_stack.pop()
+            if not block_stack:
+                try:
+                    runtime.run_script(block_lines)
+                    line_no += len(block_lines)
+                except (ReturnSignal, BreakSignal, ContinueSignal):
+                    print(f"{RED}BREAK/CONTINUE/RETURN cannot be used outside a matching function or loop here.{RESET}")
+                except Exception as exc:
+                    print(f"{RED}[ERROR] {exc}{RESET}")
+                block_lines = []
+        except (KeyboardInterrupt, EOFError):
+            print(f"\n{YELLOW}EasyScript closed.{RESET}"); break
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
