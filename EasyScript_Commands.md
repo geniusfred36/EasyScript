@@ -127,7 +127,7 @@ Use a strong secret of at least 16 characters and only on a trusted network. Do 
 
 ## 12. DuckyScript-compatible keyboard commands
 
-These commands are supported for compatible `.txt`/`.duck` scripts: `STRING`, `DELAY`, `REM`, `#`, `ENTER`, `TAB`, `SPACE`, `ESCAPE`, `BACKSPACE`, `DELETE`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `HOME`, `END`, `GUI`, `WINDOWS`, `CTRL`, `CONTROL`, `ALT`, and `SHIFT`.
+These commands are supported for compatible `.txt`/`.duck`/`.easy` scripts: `STRING`, `DELAY`, `REM`, `#`, `ENTER`, `TAB`, `SPACE`, `ESCAPE`, `BACKSPACE`, `DELETE`, `UP`, `DOWN`, `LEFT`, `RIGHT`, `HOME`, `END`, `GUI`, `WINDOWS`, `CTRL`, `CONTROL`, `ALT`, and `SHIFT`.
 
 Keyboard automation requires the optional `PyAutoGUI` dependency. Without it, key presses and typing are not performed.
 
