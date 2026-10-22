@@ -50,6 +50,8 @@ EasyScript is a custom scripting-language project. Features and command compatib
 
 Copyright © 2026 Geniusfred36. All rights reserved.
 
-EasyScript is not offered under an open-source license. Unless the copyright holder gives prior written permission or an applicable legal exception applies, you may not copy, modify, redistribute, sublicense, or create derivative works from this project. Public GitHub hosting can allow users to view or fork a public repository under GitHub's Terms of Service; that platform functionality is not a general permission to reuse the software.
+EasyScript is proprietary software and is not released under an open-source license. You may not copy, modify, redistribute, sublicense, or create derivative works of the EasyScript interpreter without prior written permission from the copyright holder, except where permitted by applicable law.
 
-DO NOT REUSE OR EDIT THIS SOFTWARE; You are allowed to fork, create tools and create add ons.
+You are welcome to create your own `.easy` scripts, compatible tools, add-ons, tutorials, and other independent projects for use with EasyScript. These projects must not improperly include or redistribute the proprietary EasyScript source code.
+
+Please credit Geniusfred36 when referring to the official EasyScript project. Permission to create independent projects does not grant permission to copy or modify the EasyScript interpreter itself.
